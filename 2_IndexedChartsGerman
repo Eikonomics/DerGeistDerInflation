@@ -1,0 +1,179 @@
+# This program prepares Eurostat data to be publishsed automatically 
+# on te Twitter page of the German Ifnlation ghost
+
+#### 1. Load libraries ####
+library(tidyverse)
+library(rtweet)
+library(twitteR)
+library(ggplot2)
+library(lubridate)
+
+#### 2. Housekeeping ####
+# clean workspace
+rm(list=ls())
+
+# colours for charts
+eikonomics_colors <- c("#073b4c","#ef476f", "#118ab2", "#ffd166", 
+                       "#06d6a0","#35B779FF", "#21908CFF")
+
+#### 3. import and clean data ####
+RawDataFile <- paste0("1_RawEuroStatData//", 
+                      list.files(path = "1_RawEuroStatData",pattern = "*.csv" ))
+data_indexd <- read.csv(RawDataFile, stringsAsFactors = FALSE)  # store data in dataframe
+data_indexd$Value <- as.numeric(data_indexd$Value)              # convert index values to number
+
+data_indexd <-  data_indexd %>%                                 #remove missing values
+  filter(!is.na(Value))
+
+data_indexd$Year  <- substr(data_indexd$TIME,1,4)               # Generate a year variable
+data_indexd$Month <- substr(data_indexd$TIME,6,8)               # Generate a month variable
+
+data_indexd$date  <- as.Date(paste0(data_indexd$Year,"-",data_indexd$Month, "-","01"),"%Y-%m-%d")      # generate date 
+
+data_indexd$product_group <- group_indices(data_indexd,COICOP)     # gen panel-id variable 
+
+#### 4. prepare the data for the plot
+#### #### 4.1 prepare the product
+MaxId <- max(data_indexd$product_group)                                 # store the value of the last panel
+RandomPrice <- sample(1:MaxId, 1, replace=FALSE)                        # pick a random product to plot later
+
+Random_product <- data_indexd %>%                                       # isolate the product into a new data.frame
+  filter(product_group == RandomPrice)
+
+min_date <- min(Random_product$date)                                    # find the first month with value data for the product
+max_date <- max(Random_product$date)                                    # find the last month with value data for the product
+
+FirstValue <- Random_product$Value[Random_product$date == min_date]     # store the first value, for re-indexing w. new base year
+Random_product$price_index <- 100 * (Random_product$Value / FirstValue) # generate a varible for new index
+
+#### #### 4.2 prepare the HICP
+Index_data <-  data_indexd %>%                                          # store HICP in a single frame
+  filter(COICOP=="All-items HICP", 
+         date >= min_date, 
+         date <= max_date)        
+Index_data$COICOP <- "Harmonisierter Verbraucherpreisindex (HVPI)"      # rename the index, for chart
+
+FirstValue <- Index_data$Value[Index_data$date == min_date]             # limit the data to the same range as the product data
+Index_data$price_index <- 100 * (Index_data$Value / FirstValue)         # re-index the index to the product index
+
+#### 5. combine data and plot on a chart
+both_series <- rbind(Index_data,Random_product)                         # combine data 
+
+plot_price_index <-                                                     # store plot
+  both_series %>%
+  ggplot() +
+  aes(x = date, y = price_index, colour = COICOP) +
+  geom_line(size = 1.3) +
+  ylab("Index") +
+  xlab("Year") +
+  theme_minimal() +
+  scale_colour_manual(values = eikonomics_colors) + 
+  labs(title =  Random_product$COICOP[1],
+       caption = "Source: Eurostat [prc_hicp_midx]",
+       subtitle = paste0("Price Development, ",
+                         min(as.numeric(Random_product$Year)),
+                         " to ",
+                         max(as.numeric(Random_product$Year)),
+                         " (",
+                         min(as.numeric(Random_product$Year)), 
+                         " = 100)")) +
+  theme(legend.position ="bottom",
+        plot.title      = element_text(hjust = 0.5, size = 32),
+        plot.subtitle   = element_text(hjust = 0.5, size = 20),
+        legend.title    = element_blank(), 
+        legend.text     = element_text(size=18),
+        axis.title      = element_text(size = 26),
+        axis.text       = element_text(size =20))
+
+ggsave(plot = plot_price_index,                                          # Save chart
+       filename = "4_Chart\\CurrentPriceChart.png",
+       width = 20, height = 9)
+
+#### 6. carry out calculations to prep for text in tweet  
+  # The following lines: 
+    # find the most recent price in data,
+    # find the HCPI data point fot the same date
+    # calculate the relative increse in the price of the radnomly selected prouct
+last_price      <- Random_product$price_index[Random_product$date == max_date]  
+last_price_index <- Index_data$price_index[Index_data$date == max_date]
+pr_incr_rand <- round(Random_product$price_index[Random_product$date == max_date] / Random_product$price_index[Random_product$date == min_date] - 1, 2)
+pr_incr_index <- round(Index_data$price_index[Index_data$date == max_date] / Index_data$price_index[Index_data$date == min_date] - 1, 2)
+
+#### 7.  Calculate the geometric monthly average, for the nerds
+Temp <- Random_product$price_index / lag(Random_product$price_index)
+Geom_monthly <- round(100 * (prod(Temp, na.rm = TRUE)^(1/length(Temp)) - 1),2)
+Geom_annually <- round(100*((1+Geom_monthly/100)^12-1),1)
+
+#### 8. calculate the difference between the randomly selected product and HCPI
+Product_min_HICP <- round(last_price - last_price_index,2)
+
+#### 9. compese the tweet
+
+# make if the nominal price of the product has fallen, it needs to be accounted for in tweet
+if (last_price >= last_price_index) {
+  Statement5 <- "mehr"
+}
+if (last_price < last_price_index) {
+  Statement5 <- "weniger"
+}
+
+#### 10. if the price of product has increased more than inflation
+if (last_price >= 100) {
+  text <- 
+    paste0("In Zeitraum seit ",  year(min_date), 
+           " habe ich es geschafft, den Preis von ",
+           "'",
+           str_to_upper(Random_product$COICOP[1]),
+           "'",
+           " in Deutschland um ",
+           abs(100 * pr_incr_rand),
+           "% ",
+           "zu steigern ",
+           "(",
+           abs(Geom_annually),
+           "% p.a.)" ,
+           ". Das sind ",
+            abs(Product_min_HICP), 
+           " Prozentpunkte ",
+           Statement5,
+           " als der gesamte Preisindex gestiegen ist.")
+}
+#### 10. if the price of product has increased less than inflation
+if (last_price < 100) {
+  text <- 
+    paste0("In Zeitraum seit ",  year(min_date), 
+         " habe ich darin versagt, den Preis von ",
+         "'",
+         str_to_upper(Random_product$COICOP[1]),
+         "'",
+         " in Deutschland um ",
+         "zu steigern und der Preis ist um  ",
+         abs(100 * pr_incr_rand),
+         "% ",
+         "(",
+         abs(Geom_annually),
+         "% p.a.)" ,
+         " gesunken. Das sind ",
+         abs(Product_min_HICP), 
+         " Prozentpunkte ",
+         Statement5,
+         " als der gesamte Preisindex gestiegen ist.")
+}
+
+#### 11. it is always nice to have a look before you send
+plot_price_index
+text
+
+#### 12. Send Tweet!
+api_key <- "[]"
+api_secret <- "[]"
+access_token <- "[]"
+access_token_secret <- "[]"
+setup_twitter_oauth(api_key,api_secret,access_token,access_token_secret)
+
+1
+
+ST <- updateStatus(text, bypassCharLimit=TRUE,
+                   mediaPath="4_Chart\\CurrentPriceChart.png")
+
+
